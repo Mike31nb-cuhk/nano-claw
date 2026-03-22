@@ -37,7 +37,10 @@ export function getContainerHostGateway(): string {
   if (_cachedHostGateway) return _cachedHostGateway;
   if (os.platform() === 'darwin') {
     const gw = detectAppleContainerGateway();
-    if (gw) { _cachedHostGateway = gw; return gw; }
+    if (gw) {
+      _cachedHostGateway = gw;
+      return gw;
+    }
     // Apple Container default bridge IP — reliable even before bridge100 appears in ifconfig
     _cachedHostGateway = '192.168.64.1';
     return _cachedHostGateway;
