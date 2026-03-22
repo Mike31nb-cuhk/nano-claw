@@ -23,6 +23,8 @@ interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
+  runId?: string;
+  instanceId?: string;
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
@@ -420,6 +422,8 @@ async function runQuery(
           env: {
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+            NANOCLAW_RUN_ID: containerInput.runId || 'default-run',
+            NANOCLAW_INSTANCE_ID: containerInput.instanceId || 'default',
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
@@ -471,7 +475,9 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(
+      `Received input for group: ${containerInput.groupFolder} (run=${containerInput.runId || 'default-run'}, instance=${containerInput.instanceId || 'default'})`,
+    );
   } catch (err) {
     writeOutput({
       status: 'error',

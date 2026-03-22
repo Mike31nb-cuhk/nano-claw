@@ -2,7 +2,12 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { MAX_CONCURRENT_CONTAINERS } from './config.js';
+import {
+  AgentRuntimeScope,
+  resolveDefaultAgentRuntimeScope,
+  resolveInstanceIpcPath,
+} from './group-folder.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -23,7 +28,7 @@ interface GroupState {
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
   containerName: string | null;
-  groupFolder: string | null;
+  runtimeScope: AgentRuntimeScope | null;
   retryCount: number;
 }
 
@@ -47,7 +52,7 @@ export class GroupQueue {
         pendingTasks: [],
         process: null,
         containerName: null,
-        groupFolder: null,
+        runtimeScope: null,
         retryCount: 0,
       };
       this.groups.set(groupJid, state);
@@ -133,12 +138,17 @@ export class GroupQueue {
     groupJid: string,
     proc: ChildProcess,
     containerName: string,
-    groupFolder?: string,
+    runtimeScope?: AgentRuntimeScope | string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
-    if (groupFolder) state.groupFolder = groupFolder;
+    if (runtimeScope) {
+      state.runtimeScope =
+        typeof runtimeScope === 'string'
+          ? resolveDefaultAgentRuntimeScope(runtimeScope)
+          : runtimeScope;
+    }
   }
 
   /**
@@ -159,11 +169,11 @@ export class GroupQueue {
    */
   sendMessage(groupJid: string, text: string): boolean {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
+    if (!state.active || !state.runtimeScope || state.isTaskContainer)
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = path.join(resolveInstanceIpcPath(state.runtimeScope), 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -182,9 +192,9 @@ export class GroupQueue {
    */
   closeStdin(groupJid: string): void {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder) return;
+    if (!state.active || !state.runtimeScope) return;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = path.join(resolveInstanceIpcPath(state.runtimeScope), 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
@@ -225,7 +235,7 @@ export class GroupQueue {
       state.active = false;
       state.process = null;
       state.containerName = null;
-      state.groupFolder = null;
+      state.runtimeScope = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -254,7 +264,7 @@ export class GroupQueue {
       state.runningTaskId = null;
       state.process = null;
       state.containerName = null;
-      state.groupFolder = null;
+      state.runtimeScope = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }

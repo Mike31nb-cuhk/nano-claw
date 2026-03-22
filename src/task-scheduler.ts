@@ -17,7 +17,12 @@ import {
   updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import {
+  AgentRuntimeScope,
+  buildSessionScopeKey,
+  resolveDefaultAgentRuntimeScope,
+  resolveGroupFolderPath,
+} from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
@@ -70,7 +75,7 @@ export interface SchedulerDependencies {
     groupJid: string,
     proc: ChildProcess,
     containerName: string,
-    groupFolder: string,
+    runtimeScope: AgentRuntimeScope,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
@@ -131,6 +136,7 @@ async function runTask(
 
   // Update tasks snapshot for container to read (filtered by group)
   const isMain = group.isMain === true;
+  const runtimeScope = resolveDefaultAgentRuntimeScope(task.group_folder);
   const tasks = getAllTasks();
   writeTasksSnapshot(
     task.group_folder,
@@ -144,6 +150,8 @@ async function runTask(
       status: t.status,
       next_run: t.next_run,
     })),
+    runtimeScope.runId,
+    runtimeScope.instanceId,
   );
 
   let result: string | null = null;
@@ -151,8 +159,11 @@ async function runTask(
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
+  const sessionScopeKey = buildSessionScopeKey(runtimeScope);
   const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+    task.context_mode === 'group'
+      ? sessions[sessionScopeKey] || sessions[task.group_folder]
+      : undefined;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -175,13 +186,15 @@ async function runTask(
         prompt: task.prompt,
         sessionId,
         groupFolder: task.group_folder,
+        runId: runtimeScope.runId,
+        instanceId: runtimeScope.instanceId,
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
       },
-      (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+      (proc, containerName, scope) =>
+        deps.onProcess(task.chat_jid, proc, containerName, scope),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;

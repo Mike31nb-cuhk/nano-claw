@@ -42,7 +42,11 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import {
+  buildSessionScopeKey,
+  resolveDefaultAgentRuntimeScope,
+  resolveGroupFolderPath,
+} from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -58,6 +62,7 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { getInteractionMode, runVotingSwarm } from './voting-swarm.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -116,6 +121,24 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     { jid, name: group.name, folder: group.folder },
     'Group registered',
   );
+}
+
+function getDefaultSessionScopeKey(groupFolder: string): string {
+  return buildSessionScopeKey(resolveDefaultAgentRuntimeScope(groupFolder));
+}
+
+function getSessionForDefaultRuntime(groupFolder: string): string | undefined {
+  const scopeKey = getDefaultSessionScopeKey(groupFolder);
+  return sessions[scopeKey] || sessions[groupFolder];
+}
+
+function setSessionForDefaultRuntime(
+  groupFolder: string,
+  sessionId: string,
+): void {
+  const scopeKey = getDefaultSessionScopeKey(groupFolder);
+  sessions[scopeKey] = sessionId;
+  setSession(scopeKey, sessionId);
 }
 
 /**
@@ -192,6 +215,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     { group: group.name, messageCount: missedMessages.length },
     'Processing messages',
   );
+
+  if (getInteractionMode(group) === 'vote') {
+    await channel.setTyping?.(chatJid, true);
+    let finalOutputSent = false;
+
+    try {
+      const votingResult = await runVotingSwarm(group, prompt, chatJid);
+      if (votingResult.finalOutput) {
+        await channel.sendMessage(chatJid, votingResult.finalOutput);
+        finalOutputSent = true;
+      }
+    } catch (err) {
+      if (!finalOutputSent) {
+        lastAgentTimestamp[chatJid] = previousCursor;
+        saveState();
+      }
+      logger.error(
+        { group: group.name, err },
+        'Voting swarm failed, rolled back message cursor',
+      );
+      await channel.setTyping?.(chatJid, false);
+      return finalOutputSent;
+    }
+
+    await channel.setTyping?.(chatJid, false);
+    return true;
+  }
 
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -271,7 +321,8 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const runtimeScope = resolveDefaultAgentRuntimeScope(group.folder);
+  const sessionId = getSessionForDefaultRuntime(group.folder);
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -287,6 +338,8 @@ async function runAgent(
       status: t.status,
       next_run: t.next_run,
     })),
+    runtimeScope.runId,
+    runtimeScope.instanceId,
   );
 
   // Update available groups snapshot (main group only can see all groups)
@@ -296,14 +349,15 @@ async function runAgent(
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
+    runtimeScope.runId,
+    runtimeScope.instanceId,
   );
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          setSessionForDefaultRuntime(group.folder, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -316,18 +370,19 @@ async function runAgent(
         prompt,
         sessionId,
         groupFolder: group.folder,
+        runId: runtimeScope.runId,
+        instanceId: runtimeScope.instanceId,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
       },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+      (proc, containerName, scope) =>
+        queue.registerProcess(chatJid, proc, containerName, scope),
       wrappedOnOutput,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      setSessionForDefaultRuntime(group.folder, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -601,8 +656,8 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onProcess: (groupJid, proc, containerName, runtimeScope) =>
+      queue.registerProcess(groupJid, proc, containerName, runtimeScope),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) {

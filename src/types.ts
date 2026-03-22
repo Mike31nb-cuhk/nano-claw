@@ -30,6 +30,8 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  interactionMode?: 'single' | 'vote';
+  workerCount?: number;
 }
 
 export interface RegisteredGroup {

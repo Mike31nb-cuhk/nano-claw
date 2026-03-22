@@ -27,6 +27,29 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
+function getIpcNamespacesForGroup(groupDir: string): string[] {
+  const namespaces = [groupDir];
+  const runsDir = path.join(groupDir, 'runs');
+  if (!fs.existsSync(runsDir)) return namespaces;
+
+  for (const runId of fs.readdirSync(runsDir)) {
+    const instancesDir = path.join(runsDir, runId, 'instances');
+    if (!fs.existsSync(instancesDir)) continue;
+    for (const instanceId of fs.readdirSync(instancesDir)) {
+      const namespaceDir = path.join(instancesDir, instanceId);
+      try {
+        if (fs.statSync(namespaceDir).isDirectory()) {
+          namespaces.push(namespaceDir);
+        }
+      } catch {
+        // Ignore directories that disappear during polling.
+      }
+    }
+  }
+
+  return namespaces;
+}
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -38,7 +61,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
+    // Scan all group IPC directories (identity determined by top-level directory).
+    // Each group may now contain multiple instance namespaces under runs/*/instances/*.
     let groupFolders: string[];
     try {
       groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
@@ -61,89 +85,98 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
     for (const sourceGroup of groupFolders) {
       const isMain = folderIsMain.get(sourceGroup) === true;
-      const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
-      const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
+      const groupDir = path.join(ipcBaseDir, sourceGroup);
+      const namespaceDirs = getIpcNamespacesForGroup(groupDir);
 
-      // Process messages from this group's IPC directory
-      try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs
-            .readdirSync(messagesDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
+      for (const namespaceDir of namespaceDirs) {
+        const messagesDir = path.join(namespaceDir, 'messages');
+        const tasksDir = path.join(namespaceDir, 'tasks');
+        const namespaceLabel = path.relative(groupDir, namespaceDir) || '.';
+
+        // Process messages from this IPC namespace
+        try {
+          if (fs.existsSync(messagesDir)) {
+            const messageFiles = fs
+              .readdirSync(messagesDir)
+              .filter((f) => f.endsWith('.json'));
+            for (const file of messageFiles) {
+              const filePath = path.join(messagesDir, file);
+              try {
+                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                if (data.type === 'message' && data.chatJid && data.text) {
+                  // Authorization: verify this group can send to this chatJid
+                  const targetGroup = registeredGroups[data.chatJid];
+                  if (
+                    isMain ||
+                    (targetGroup && targetGroup.folder === sourceGroup)
+                  ) {
+                    await deps.sendMessage(data.chatJid, data.text);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, namespace: namespaceLabel },
+                      'IPC message sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup, namespace: namespaceLabel },
+                      'Unauthorized IPC message attempt blocked',
+                    );
+                  }
                 }
+                fs.unlinkSync(filePath);
+              } catch (err) {
+                logger.error(
+                  { file, sourceGroup, namespace: namespaceLabel, err },
+                  'Error processing IPC message',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
               }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
             }
           }
+        } catch (err) {
+          logger.error(
+            { err, sourceGroup, namespace: namespaceLabel },
+            'Error reading IPC messages directory',
+          );
         }
-      } catch (err) {
-        logger.error(
-          { err, sourceGroup },
-          'Error reading IPC messages directory',
-        );
-      }
 
-      // Process tasks from this group's IPC directory
-      try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs
-            .readdirSync(tasksDir)
-            .filter((f) => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isMain, deps);
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC task',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+        // Process tasks from this IPC namespace
+        try {
+          if (fs.existsSync(tasksDir)) {
+            const taskFiles = fs
+              .readdirSync(tasksDir)
+              .filter((f) => f.endsWith('.json'));
+            for (const file of taskFiles) {
+              const filePath = path.join(tasksDir, file);
+              try {
+                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                // Pass source group identity to processTaskIpc for authorization
+                await processTaskIpc(data, sourceGroup, isMain, deps);
+                fs.unlinkSync(filePath);
+              } catch (err) {
+                logger.error(
+                  { file, sourceGroup, namespace: namespaceLabel, err },
+                  'Error processing IPC task',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              }
             }
           }
+        } catch (err) {
+          logger.error(
+            { err, sourceGroup, namespace: namespaceLabel },
+            'Error reading IPC tasks directory',
+          );
         }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
     }
 
@@ -151,7 +184,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
   };
 
   processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  logger.info('IPC watcher started (group + instance namespaces)');
 }
 
 export async function processTaskIpc(

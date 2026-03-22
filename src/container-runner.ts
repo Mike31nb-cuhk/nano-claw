@@ -11,12 +11,22 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
-  DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import {
+  AgentRuntimeScope,
+  DEFAULT_INSTANCE_ID,
+  DEFAULT_RUN_ID,
+  resolveAgentRuntimeScope,
+  resolveGroupFolderPath,
+  resolveInstanceAgentRunnerSrcPath,
+  resolveInstanceClaudePath,
+  resolveInstanceIpcPath,
+  resolveLegacyGroupAgentRunnerSrcPath,
+  resolveLegacyGroupClaudePath,
+} from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
@@ -37,6 +47,8 @@ export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
+  runId?: string;
+  instanceId?: string;
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
@@ -56,13 +68,35 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+function resolveContainerRuntimeScope(input: ContainerInput): AgentRuntimeScope {
+  return resolveAgentRuntimeScope(
+    input.groupFolder,
+    input.runId,
+    input.instanceId,
+  );
+}
+
+function isDefaultRuntimeScope(scope: AgentRuntimeScope): boolean {
+  return (
+    scope.runId === DEFAULT_RUN_ID && scope.instanceId === DEFAULT_INSTANCE_ID
+  );
+}
+
+function seedScopedDirectory(destinationDir: string, legacyDir: string): void {
+  if (!fs.existsSync(destinationDir) && fs.existsSync(legacyDir)) {
+    fs.cpSync(legacyDir, destinationDir, { recursive: true });
+  }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
-  isMain: boolean,
+  input: ContainerInput,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
+  const runtimeScope = resolveContainerRuntimeScope(input);
+  const isMain = input.isMain;
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -113,14 +147,16 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  // Per-instance Claude sessions directory.
+  // The default single-agent runtime is seeded from the legacy per-group path
+  // so existing sessions continue to work after the layout split.
+  const groupSessionsDir = resolveInstanceClaudePath(runtimeScope);
+  if (isDefaultRuntimeScope(runtimeScope)) {
+    seedScopedDirectory(
+      groupSessionsDir,
+      resolveLegacyGroupClaudePath(group.folder),
+    );
+  }
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
@@ -163,12 +199,15 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  // Per-instance IPC namespace: future multi-agent runs can isolate control
+  // planes while the default single-agent path still resolves deterministically.
+  const groupIpcDir = resolveInstanceIpcPath(runtimeScope);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'host-input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'control'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'outbox'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -184,12 +223,13 @@ function buildVolumeMounts(
     'agent-runner',
     'src',
   );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
+  const groupAgentRunnerDir = resolveInstanceAgentRunnerSrcPath(runtimeScope);
+  if (isDefaultRuntimeScope(runtimeScope)) {
+    seedScopedDirectory(
+      groupAgentRunnerDir,
+      resolveLegacyGroupAgentRunnerSrcPath(group.folder),
+    );
+  }
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
@@ -267,17 +307,23 @@ function buildContainerArgs(
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onProcess: (
+    proc: ChildProcess,
+    containerName: string,
+    runtimeScope: AgentRuntimeScope,
+  ) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const runtimeScope = resolveContainerRuntimeScope(input);
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  const safeInstance = runtimeScope.instanceId.replace(/[^a-zA-Z0-9-]/g, '-');
+  const containerName = `nanoclaw-${safeName}-${safeInstance}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
   logger.debug(
@@ -299,6 +345,8 @@ export async function runContainerAgent(
       containerName,
       mountCount: mounts.length,
       isMain: input.isMain,
+      runId: runtimeScope.runId,
+      instanceId: runtimeScope.instanceId,
     },
     'Spawning container agent',
   );
@@ -311,7 +359,7 @@ export async function runContainerAgent(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    onProcess(container, containerName);
+    onProcess(container, containerName, runtimeScope);
 
     let stdout = '';
     let stderr = '';
@@ -664,9 +712,13 @@ export function writeTasksSnapshot(
     status: string;
     next_run: string | null;
   }>,
+  runId = DEFAULT_RUN_ID,
+  instanceId = DEFAULT_INSTANCE_ID,
 ): void {
-  // Write filtered tasks to the group's IPC directory
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  // Write filtered tasks to the instance IPC directory.
+  const groupIpcDir = resolveInstanceIpcPath(
+    resolveAgentRuntimeScope(groupFolder, runId, instanceId),
+  );
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Main sees all tasks, others only see their own
@@ -695,8 +747,12 @@ export function writeGroupsSnapshot(
   isMain: boolean,
   groups: AvailableGroup[],
   _registeredJids: Set<string>,
+  runId = DEFAULT_RUN_ID,
+  instanceId = DEFAULT_INSTANCE_ID,
 ): void {
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const groupIpcDir = resolveInstanceIpcPath(
+    resolveAgentRuntimeScope(groupFolder, runId, instanceId),
+  );
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Main sees all groups; others see nothing (they can't activate groups)
