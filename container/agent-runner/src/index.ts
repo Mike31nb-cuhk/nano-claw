@@ -433,8 +433,14 @@ async function runQuery(
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+    if (message.type === 'assistant') {
+      if ('uuid' in message) lastAssistantUuid = (message as { uuid: string }).uuid;
+      const msg = message as { message?: { content?: unknown } };
+      const content = msg.message?.content;
+      if (Array.isArray(content)) {
+        const texts = content.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text);
+        log(`Assistant content (${content.length} blocks): ${texts.join('').slice(0, 300)}`);
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -450,7 +456,7 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      log(`Result #${resultCount}: subtype=${message.subtype} keys=${Object.keys(message).join(',')}${textResult ? ` text=${textResult.slice(0, 200)}` : ' (no text)'}`);
       writeOutput({
         status: 'success',
         result: textResult || null,

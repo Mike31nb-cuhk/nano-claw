@@ -19,13 +19,14 @@ import {
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  CONTAINER_HOST_GATEWAY,
+  getContainerHostGateway,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -76,16 +77,9 @@ function buildVolumeMounts(
       readonly: true,
     });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the credential proxy, never exposed to containers.
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
+    // .env shadowing is handled inside the container by the entrypoint.sh via
+    // mount --bind /dev/null /workspace/project/.env (requires root, before
+    // privilege drop). Apple Container does not support file-to-file host mounts.
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -225,8 +219,14 @@ function buildContainerArgs(
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    `ANTHROPIC_BASE_URL=http://${getContainerHostGateway()}:${CREDENTIAL_PROXY_PORT}`,
   );
+
+  // Pass the model so the SDK uses the correct one via the proxy
+  const envSecrets = readEnvFile(['CLAUDE_MODEL']);
+  if (envSecrets.CLAUDE_MODEL) {
+    args.push('-e', `CLAUDE_MODEL=${envSecrets.CLAUDE_MODEL}`);
+  }
 
   // Mirror the host's auth method with a placeholder value.
   // API key mode: SDK sends x-api-key, proxy replaces with real key.

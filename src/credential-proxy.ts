@@ -34,15 +34,19 @@ export function startCredentialProxy(
     'ANTHROPIC_BASE_URL',
   ]);
 
-  const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
-  const oauthToken =
-    secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
+  // ANTHROPIC_AUTH_TOKEN (e.g. OpenRouter key) also triggers api-key mode:
+  // it gets injected as x-api-key so no OAuth exchange endpoint is needed.
+  const apiKey = secrets.ANTHROPIC_API_KEY || secrets.ANTHROPIC_AUTH_TOKEN;
+  const authMode: AuthMode = apiKey ? 'api-key' : 'oauth';
+  const oauthToken = secrets.CLAUDE_CODE_OAUTH_TOKEN;
 
   const upstreamUrl = new URL(
     secrets.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
   );
   const isHttps = upstreamUrl.protocol === 'https:';
   const makeRequest = isHttps ? httpsRequest : httpRequest;
+  // Strip trailing slash so we can cleanly prefix req.url (which starts with /)
+  const upstreamPathPrefix = upstreamUrl.pathname.replace(/\/$/, '');
 
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
@@ -65,7 +69,7 @@ export function startCredentialProxy(
         if (authMode === 'api-key') {
           // API key mode: inject x-api-key on every request
           delete headers['x-api-key'];
-          headers['x-api-key'] = secrets.ANTHROPIC_API_KEY;
+          headers['x-api-key'] = apiKey;
         } else {
           // OAuth mode: replace placeholder Bearer token with the real one
           // only when the container actually sends an Authorization header
@@ -83,7 +87,7 @@ export function startCredentialProxy(
           {
             hostname: upstreamUrl.hostname,
             port: upstreamUrl.port || (isHttps ? 443 : 80),
-            path: req.url,
+            path: upstreamPathPrefix + req.url,
             method: req.method,
             headers,
           } as RequestOptions,
@@ -120,6 +124,8 @@ export function startCredentialProxy(
 
 /** Detect which auth mode the host is configured for. */
 export function detectAuthMode(): AuthMode {
-  const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
-  return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+  const secrets = readEnvFile(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']);
+  return secrets.ANTHROPIC_API_KEY || secrets.ANTHROPIC_AUTH_TOKEN
+    ? 'api-key'
+    : 'oauth';
 }

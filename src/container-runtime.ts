@@ -11,11 +11,46 @@ import { logger } from './logger.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'container';
 
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+/**
+ * Apple Container (macOS) uses a QEMU virtual network bridged on 'bridge100'.
+ * The host is reachable from containers at the bridge IP (typically 192.168.64.1).
+ * Returns the IPv4 address of bridge100, or null if not present.
+ */
+function detectAppleContainerGateway(): string | null {
+  const ifaces = os.networkInterfaces();
+  const bridge100 = ifaces['bridge100'];
+  if (bridge100) {
+    const ipv4 = bridge100.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+  return null;
+}
+
+/**
+ * Hostname/IP containers use to reach the host machine.
+ * Apple Container: bridge100 IP (e.g. 192.168.64.1) — host.docker.internal is not registered.
+ * Docker Desktop / Linux: host.docker.internal.
+ */
+/** Lazily resolved so bridge100 has time to appear after first container boot. */
+let _cachedHostGateway: string | undefined;
+export function getContainerHostGateway(): string {
+  if (_cachedHostGateway) return _cachedHostGateway;
+  if (os.platform() === 'darwin') {
+    const gw = detectAppleContainerGateway();
+    if (gw) { _cachedHostGateway = gw; return gw; }
+    // Apple Container default bridge IP — reliable even before bridge100 appears in ifconfig
+    _cachedHostGateway = '192.168.64.1';
+    return _cachedHostGateway;
+  }
+  _cachedHostGateway = 'host.docker.internal';
+  return _cachedHostGateway;
+}
+/** @deprecated Use getContainerHostGateway() — kept for backward compat */
+export const CONTAINER_HOST_GATEWAY: string = 'host.docker.internal';
 
 /**
  * Address the credential proxy binds to.
+ * Apple Container (macOS): bridge100 IP — containers reach the host via that interface.
  * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
  * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
  *   falling back to 0.0.0.0 if the interface isn't found.
@@ -24,7 +59,15 @@ export const PROXY_BIND_HOST =
   process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
 
 function detectProxyBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
+  if (os.platform() === 'darwin') {
+    // Apple Container exposes host via bridge100; bind there so containers can reach the proxy.
+    const gw = detectAppleContainerGateway();
+    if (gw) return gw;
+    // Apple Container: bridge100 may not exist yet (created on first container boot).
+    // Bind to 0.0.0.0 so the proxy is reachable once the bridge comes up.
+    // Docker Desktop fallback: VM routes host.docker.internal → loopback anyway.
+    return '0.0.0.0';
+  }
 
   // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
@@ -50,8 +93,14 @@ export function hostGatewayArgs(): string[] {
 }
 
 /** Returns CLI args for a readonly bind mount. */
-export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
-  return ['--mount', `type=bind,source=${hostPath},target=${containerPath},readonly`];
+export function readonlyMountArgs(
+  hostPath: string,
+  containerPath: string,
+): string[] {
+  return [
+    '--mount',
+    `type=bind,source=${hostPath},target=${containerPath},readonly`,
+  ];
 }
 
 /** Returns the shell command to stop a container by name. */
@@ -67,7 +116,10 @@ export function ensureContainerRuntimeRunning(): void {
   } catch {
     logger.info('Starting container runtime...');
     try {
-      execSync(`${CONTAINER_RUNTIME_BIN} system start`, { stdio: 'pipe', timeout: 30000 });
+      execSync(`${CONTAINER_RUNTIME_BIN} system start`, {
+        stdio: 'pipe',
+        timeout: 30000,
+      });
       logger.info('Container runtime started');
     } catch (err) {
       logger.error({ err }, 'Failed to start container runtime');
@@ -107,17 +159,26 @@ export function cleanupOrphans(): void {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const containers: { status: string; configuration: { id: string } }[] =
+      JSON.parse(output || '[]');
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
+      .filter(
+        (c) =>
+          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
+      )
       .map((c) => c.configuration.id);
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });
-      } catch { /* already stopped */ }
+      } catch {
+        /* already stopped */
+      }
     }
     if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
+      logger.info(
+        { count: orphans.length, names: orphans },
+        'Stopped orphaned containers',
+      );
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
