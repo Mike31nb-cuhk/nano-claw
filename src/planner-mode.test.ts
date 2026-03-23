@@ -190,7 +190,9 @@ describe('planner-mode helpers', () => {
     expect(() =>
       validatePlannerPlan(
         {
-          agents: [{ role: 'critic', goal: 'Find risks', instructions: 'Focus' }],
+          agents: [
+            { role: 'critic', goal: 'Find risks', instructions: 'Focus' },
+          ],
         },
         3,
         2,

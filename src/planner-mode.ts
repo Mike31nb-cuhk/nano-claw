@@ -261,10 +261,12 @@ export function buildPlannerAggregatorPrompt(
       `${index + 1}. ${agent.instanceId} | role=${agent.role} | goal=${agent.goal} | instructions=${agent.instructions}`,
   );
   const roleSummaryLines = plan.agents.map(
-    (agent, index) => `${index + 1}. ${agent.instanceId}：${agent.role}，${agent.goal}`,
+    (agent, index) =>
+      `${index + 1}. ${agent.instanceId}：${agent.role}，${agent.goal}`,
   );
   const roleSummaryLinesEn = plan.agents.map(
-    (agent, index) => `${index + 1}. ${agent.instanceId}: ${agent.role}, ${agent.goal}`,
+    (agent, index) =>
+      `${index + 1}. ${agent.instanceId}: ${agent.role}, ${agent.goal}`,
   );
   const workerSections = workerResults.map((result, index) => {
     const agent = plan.agents[index];
