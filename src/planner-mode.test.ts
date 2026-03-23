@@ -20,6 +20,7 @@ vi.mock('./group-folder.js', () => ({
 
 import type { RegisteredGroup } from './types.js';
 import {
+  buildPlannerAggregatorPrompt,
   buildPlannerPrompt,
   parsePlannerPlan,
   resolvePlannerConfig,
@@ -44,6 +45,7 @@ describe('planner-mode helpers', () => {
     expect(resolvePlannerConfig()).toEqual({
       enabled: false,
       maxAgents: 3,
+      fixedAgents: undefined,
       plannerModel: undefined,
       workerModel: undefined,
       aggregatorModel: undefined,
@@ -60,9 +62,25 @@ describe('planner-mode helpers', () => {
     ).toEqual({
       enabled: true,
       maxAgents: 5,
+      fixedAgents: undefined,
       plannerModel: 'planner-model',
       workerModel: 'worker-model',
       aggregatorModel: 'aggregator-model',
+    });
+
+    expect(
+      resolvePlannerConfig({
+        enabled: true,
+        maxAgents: 2,
+        fixedAgents: 4,
+      }),
+    ).toEqual({
+      enabled: true,
+      maxAgents: 4,
+      fixedAgents: 4,
+      plannerModel: undefined,
+      workerModel: undefined,
+      aggregatorModel: undefined,
     });
   });
 
@@ -71,6 +89,56 @@ describe('planner-mode helpers', () => {
     expect(prompt).toContain('Return JSON only.');
     expect(prompt).toContain('"agents"');
     expect(prompt).toContain('Design a launch plan');
+  });
+
+  it('builds a planner prompt that can lock the worker count for experiments', () => {
+    const prompt = buildPlannerPrompt('Design a launch plan', 5, 3);
+    expect(prompt).toContain('exactly 3 worker agents');
+    expect(prompt).toContain('must contain exactly 3 items');
+  });
+
+  it('builds an aggregator prompt with the standardized planner output structure', () => {
+    const aggregatorPrompt = buildPlannerAggregatorPrompt(
+      '设计一个抓钩技能',
+      {
+        agents: [
+          {
+            instanceId: 'worker-1',
+            role: 'mechanics-designer',
+            goal: '负责核心力学与绳索物理',
+            instructions: '聚焦物理与状态机',
+          },
+          {
+            instanceId: 'worker-2',
+            role: 'ux-designer',
+            goal: '负责手感与视觉反馈',
+            instructions: '聚焦体验与反馈',
+          },
+        ],
+      },
+      [
+        {
+          instanceId: 'worker-1',
+          role: 'worker',
+          status: 'success',
+          result: 'Worker 1 output',
+        },
+        {
+          instanceId: 'worker-2',
+          role: 'worker',
+          status: 'success',
+          result: 'Worker 2 output',
+        },
+      ],
+    );
+
+    expect(aggregatorPrompt).toContain('## 分工思路');
+    expect(aggregatorPrompt).toContain('## 分工角色');
+    expect(aggregatorPrompt).toContain('## 实现要点');
+    expect(aggregatorPrompt).toContain('## 完整回复');
+    expect(aggregatorPrompt).toContain(
+      '1. worker-1：mechanics-designer，负责核心力学与绳索物理',
+    );
   });
 
   it('parses a fenced planner JSON plan and normalizes worker ids', () => {
@@ -119,6 +187,15 @@ describe('planner-mode helpers', () => {
         3,
       ),
     ).toThrow('Planner output exceeds maxAgents');
+    expect(() =>
+      validatePlannerPlan(
+        {
+          agents: [{ role: 'critic', goal: 'Find risks', instructions: 'Focus' }],
+        },
+        3,
+        2,
+      ),
+    ).toThrow('Planner output must include exactly 2 agents');
   });
 });
 
@@ -224,6 +301,37 @@ describe('runPlannerMode', () => {
 
     expect(result.status).toBe('error');
     expect(result.error).toBe('Planner output must be valid JSON.');
+    expect(runInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails immediately when fixedAgents is configured but planner returns the wrong count', async () => {
+    const runInstance = vi.fn(async (invocation: PlannerAgentInvocation) => ({
+      instanceId: invocation.instanceId,
+      role: invocation.role,
+      status: 'success' as const,
+      result:
+        '{"agents":[{"role":"critic","goal":"Find risks","instructions":"Focus on failure modes"}]}',
+    }));
+
+    const result = await runPlannerMode({
+      group: {
+        ...baseGroup,
+        containerConfig: {
+          planner: {
+            enabled: true,
+            fixedAgents: 2,
+          },
+        },
+      },
+      prompt: 'Analyze the request',
+      chatJid: 'plan@g.us',
+      deps: { runInstance },
+    });
+
+    expect(result.status).toBe('error');
+    expect(result.error).toBe(
+      'Planner output must include exactly 2 agents; received 1.',
+    );
     expect(runInstance).toHaveBeenCalledTimes(1);
   });
 

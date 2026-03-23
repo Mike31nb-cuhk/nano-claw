@@ -16,6 +16,7 @@ const HAN_SCRIPT_REGEX = /[\u3400-\u9fff]/;
 export interface ResolvedPlannerConfig {
   enabled: boolean;
   maxAgents: number;
+  fixedAgents?: number;
   plannerModel?: string;
   workerModel?: string;
   aggregatorModel?: string;
@@ -94,17 +95,24 @@ export function resolvePlannerConfig(
   config?: PlannerConfig,
 ): ResolvedPlannerConfig {
   const enabled = config?.enabled === true;
-  const maxAgents = Math.max(
-    1,
-    Math.min(
-      config?.maxAgents || DEFAULT_PLANNER_MAX_AGENTS,
-      MAX_PLANNER_AGENTS,
-    ),
-  );
+  const fixedAgents =
+    typeof config?.fixedAgents === 'number'
+      ? Math.max(1, Math.min(config.fixedAgents, MAX_PLANNER_AGENTS))
+      : undefined;
+  const maxAgents =
+    fixedAgents ||
+    Math.max(
+      1,
+      Math.min(
+        config?.maxAgents || DEFAULT_PLANNER_MAX_AGENTS,
+        MAX_PLANNER_AGENTS,
+      ),
+    );
 
   return {
     enabled,
     maxAgents,
+    fixedAgents,
     plannerModel: config?.plannerModel,
     workerModel: config?.workerModel,
     aggregatorModel: config?.aggregatorModel,
@@ -118,10 +126,17 @@ export function createPlannerRunId(): string {
 export function buildPlannerPrompt(
   userPrompt: string,
   maxAgents: number,
+  fixedAgents?: number,
 ): string {
+  const agentCountInstruction = fixedAgents
+    ? `Create a focused execution plan with exactly ${fixedAgents} worker agents.`
+    : `Create a focused execution plan with between 1 and ${maxAgents} worker agents.`;
+  const agentCountSchemaRule = fixedAgents
+    ? `The \`agents\` array must contain exactly ${fixedAgents} items.`
+    : `The \`agents\` array may contain between 1 and ${maxAgents} items.`;
   return [
     'You are the planner in a planner-style multi-agent run inside NanoClaw.',
-    `Create a focused execution plan with between 1 and ${maxAgents} worker agents.`,
+    agentCountInstruction,
     'Return JSON only. Do not include commentary before or after the JSON.',
     'Use exactly this schema:',
     '{',
@@ -133,6 +148,7 @@ export function buildPlannerPrompt(
     '    }',
     '  ]',
     '}',
+    agentCountSchemaRule,
     'Each agent must contain only these non-empty string fields: role, goal, instructions.',
     'Do not include ids, models, tool settings, or any extra keys.',
     '',
@@ -144,6 +160,7 @@ export function buildPlannerPrompt(
 export function validatePlannerPlan(
   plan: unknown,
   maxAgents: number,
+  fixedAgents?: number,
 ): NormalizedPlannerPlan {
   if (!plan || typeof plan !== 'object') {
     throw new Error('Planner output must be a JSON object.');
@@ -156,6 +173,12 @@ export function validatePlannerPlan(
 
   if (agents.length === 0) {
     throw new Error('Planner output must include at least one agent.');
+  }
+
+  if (fixedAgents && agents.length !== fixedAgents) {
+    throw new Error(
+      `Planner output must include exactly ${fixedAgents} agents; received ${agents.length}.`,
+    );
   }
 
   if (agents.length > maxAgents) {
@@ -188,6 +211,7 @@ export function validatePlannerPlan(
 export function parsePlannerPlan(
   raw: string,
   maxAgents: number,
+  fixedAgents?: number,
 ): NormalizedPlannerPlan {
   const stripped = stripCodeFences(raw);
 
@@ -198,7 +222,7 @@ export function parsePlannerPlan(
     throw new Error('Planner output must be valid JSON.');
   }
 
-  return validatePlannerPlan(parsed, maxAgents);
+  return validatePlannerPlan(parsed, maxAgents, fixedAgents);
 }
 
 export function buildPlannerWorkerPrompt(
@@ -236,6 +260,12 @@ export function buildPlannerAggregatorPrompt(
     (agent, index) =>
       `${index + 1}. ${agent.instanceId} | role=${agent.role} | goal=${agent.goal} | instructions=${agent.instructions}`,
   );
+  const roleSummaryLines = plan.agents.map(
+    (agent, index) => `${index + 1}. ${agent.instanceId}：${agent.role}，${agent.goal}`,
+  );
+  const roleSummaryLinesEn = plan.agents.map(
+    (agent, index) => `${index + 1}. ${agent.instanceId}: ${agent.role}, ${agent.goal}`,
+  );
   const workerSections = workerResults.map((result, index) => {
     const agent = plan.agents[index];
     return [
@@ -248,16 +278,32 @@ export function buildPlannerAggregatorPrompt(
     return [
       '你是 NanoClaw 分工模式中的 aggregator。',
       '你会收到原始用户请求、一份已验证的分工计划，以及每个 worker 的输出。',
-      '请综合这些材料，直接给出面向用户的最终答案。',
-      '不要输出 JSON，不要复述内部编排过程。',
+      '请综合这些材料，输出一份结构清晰、面向用户的最终答案。',
+      '可以简短说明分工，但不要长篇复述内部编排过程。',
       '如果 worker 之间有冲突，请主动做判断并输出单一答案。',
       '使用与用户请求相同的语言。',
+      '你的回答必须严格按下面顺序输出：',
+      '## 分工思路',
+      '用 2 到 4 句说明为什么这样拆分任务，以及整体是如何收敛的。',
+      '',
+      '## 分工角色',
+      '按顺序列出每个 worker 的角色与职责，每个 worker 一行。',
+      `示例：1. worker-1：mechanics-designer，负责核心力学与绳索物理`,
+      '',
+      '## 实现要点',
+      '用 3 到 5 条短 bullet 概括最终方案的关键实现思路。',
+      '',
+      '## 完整回复',
+      '最后给出完整、可直接阅读的正式回答。',
       '',
       '原始用户请求：',
       userPrompt,
       '',
       '分工计划：',
       planLines.join('\n'),
+      '',
+      '建议使用的角色摘要：',
+      roleSummaryLines.join('\n'),
       '',
       'Worker 输出：',
       workerSections.join('\n\n'),
@@ -267,16 +313,32 @@ export function buildPlannerAggregatorPrompt(
   return [
     'You are the aggregator in a planner-style multi-agent run inside NanoClaw.',
     'You will receive the original user request, a validated work plan, and the outputs from each worker.',
-    'Synthesize them into one final answer for the user.',
-    'Do not output JSON and do not describe internal orchestration unless it helps the user.',
+    'Synthesize them into one structured final answer for the user.',
+    'You may briefly explain the work split, but do not spend too much time describing internal orchestration.',
     'If the workers disagree, resolve the conflict and present one clear answer.',
     'Use the same language as the user request unless there is a strong reason not to.',
+    'Your answer must use this exact section order:',
+    '## Work Split',
+    'Use 2 to 4 sentences to explain the division strategy and how the plan converged.',
+    '',
+    '## Worker Roles',
+    'List each worker in order, one line each, with role and responsibility.',
+    `Example: 1. worker-1: mechanics-designer, responsible for core mechanics and rope physics`,
+    '',
+    '## Implementation Summary',
+    'Give 3 to 5 short bullet points that summarize the key implementation ideas.',
+    '',
+    '## Full Response',
+    'Finish with the complete user-facing answer.',
     '',
     'Original user request:',
     userPrompt,
     '',
     'Validated plan:',
     planLines.join('\n'),
+    '',
+    'Suggested worker role summary:',
+    roleSummaryLinesEn.join('\n'),
     '',
     'Worker outputs:',
     workerSections.join('\n\n'),
@@ -428,6 +490,7 @@ export async function runPlannerMode(args: {
       group: group.name,
       runId,
       maxAgents: config.maxAgents,
+      fixedAgents: config.fixedAgents,
     },
     'Starting planner-mode run',
   );
@@ -435,7 +498,7 @@ export async function runPlannerMode(args: {
   const plannerInvocation: PlannerAgentInvocation = {
     instanceId: 'planner',
     role: 'planner',
-    prompt: buildPlannerPrompt(prompt, config.maxAgents),
+    prompt: buildPlannerPrompt(prompt, config.maxAgents, config.fixedAgents),
     runtime: createAgentInstanceRuntime(
       group.folder,
       runId,
@@ -473,7 +536,11 @@ export async function runPlannerMode(args: {
 
   let plan: NormalizedPlannerPlan;
   try {
-    plan = parsePlannerPlan(plannerResult.result, config.maxAgents);
+    plan = parsePlannerPlan(
+      plannerResult.result,
+      config.maxAgents,
+      config.fixedAgents,
+    );
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     archivePlannerRun({

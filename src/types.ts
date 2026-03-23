@@ -46,6 +46,7 @@ export interface VotingConfig {
 export interface PlannerConfig {
   enabled?: boolean;
   maxAgents?: number;
+  fixedAgents?: number;
   plannerModel?: string;
   workerModel?: string;
   aggregatorModel?: string;
