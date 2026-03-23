@@ -14,7 +14,8 @@ vi.mock('fs', async () => {
 });
 
 vi.mock('./group-folder.js', () => ({
-  resolveGroupIpcPath: (folder: string) => `/tmp/nanoclaw-test-data/ipc/${folder}`,
+  resolveGroupIpcPath: (folder: string) =>
+    `/tmp/nanoclaw-test-data/ipc/${folder}`,
 }));
 
 import type { RegisteredGroup } from './types.js';
@@ -91,20 +92,23 @@ describe('voting-mode helpers', () => {
   });
 
   it('uses Chinese headings and extracted candidates for Chinese prompts', () => {
-    const aggregatorPrompt = buildAggregatorPrompt('猜谜语：什么东西人死后朝天？', [
-      {
-        instanceId: 'worker-1',
-        role: 'worker',
-        status: 'success',
-        result: 'Candidate: 鼻孔\n因为人平躺后鼻孔朝上。',
-      },
-      {
-        instanceId: 'worker-2',
-        role: 'worker',
-        status: 'success',
-        result: 'Candidate: 脚底\n从四脚朝天的角度理解。',
-      },
-    ]);
+    const aggregatorPrompt = buildAggregatorPrompt(
+      '猜谜语：什么东西人死后朝天？',
+      [
+        {
+          instanceId: 'worker-1',
+          role: 'worker',
+          status: 'success',
+          result: 'Candidate: 鼻孔\n因为人平躺后鼻孔朝上。',
+        },
+        {
+          instanceId: 'worker-2',
+          role: 'worker',
+          status: 'success',
+          result: 'Candidate: 脚底\n从四脚朝天的角度理解。',
+        },
+      ],
+    );
 
     expect(aggregatorPrompt).toContain('## Runner 回答');
     expect(aggregatorPrompt).toContain('## 最终答案');
@@ -236,6 +240,8 @@ describe('runVotingMode', () => {
         String(filePath).includes(`/runs/${result.runId}/results/final.json`),
       )?.[1];
     expect(String(finalPayload)).toContain('"usedFallback": true');
-    expect(String(finalPayload)).toContain('"finalSourceInstanceId": "worker-2"');
+    expect(String(finalPayload)).toContain(
+      '"finalSourceInstanceId": "worker-2"',
+    );
   });
 });

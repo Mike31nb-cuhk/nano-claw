@@ -32,12 +32,21 @@ export interface ContainerConfig {
   timeout?: number; // Default: 300000 (5 minutes)
   model?: string;
   voting?: VotingConfig;
+  planner?: PlannerConfig;
 }
 
 export interface VotingConfig {
   enabled?: boolean;
   workerCount?: number;
   minSuccesses?: number;
+  workerModel?: string;
+  aggregatorModel?: string;
+}
+
+export interface PlannerConfig {
+  enabled?: boolean;
+  maxAgents?: number;
+  plannerModel?: string;
   workerModel?: string;
   aggregatorModel?: string;
 }

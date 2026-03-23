@@ -18,6 +18,7 @@ import {
   getRegisteredChannelNames,
 } from './channels/registry.js';
 import {
+  AgentInstanceRuntime,
   ContainerOutput,
   runContainerAgent,
   writeContainerCloseSignal,
@@ -63,6 +64,11 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  PlannerAgentInvocation,
+  PlannerAgentResult,
+  runPlannerMode,
+} from './planner-mode.js';
 import {
   runVotingMode,
   VotingAgentInvocation,
@@ -146,20 +152,39 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
     }));
 }
 
+interface OrchestratedAgentInvocation {
+  instanceId: string;
+  role: 'planner' | 'worker' | 'aggregator';
+  prompt: string;
+  runtime: AgentInstanceRuntime;
+}
+
+interface OrchestratedAgentResult {
+  instanceId: string;
+  role: 'planner' | 'worker' | 'aggregator';
+  status: 'success' | 'error';
+  result: string | null;
+  error?: string;
+}
+
 function stripInternalOutput(raw: string): string {
   return raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+}
+
+function isPlannerModeEnabled(group: RegisteredGroup): boolean {
+  return group.containerConfig?.planner?.enabled === true;
 }
 
 function isVotingModeEnabled(group: RegisteredGroup): boolean {
   return group.containerConfig?.voting?.enabled === true;
 }
 
-async function runVotingAgentInstance(
+async function runOrchestratedAgentInstance(
   group: RegisteredGroup,
   chatJid: string,
-  invocation: VotingAgentInvocation,
-): Promise<VotingAgentResult> {
-  const VOTING_CLOSE_GRACE_MS = 10_000;
+  invocation: OrchestratedAgentInvocation,
+): Promise<OrchestratedAgentResult> {
+  const ORCHESTRATION_CLOSE_GRACE_MS = 10_000;
   const isMain = group.isMain === true;
   const taskRows = getAllTasks().map((task) => ({
     id: task.id,
@@ -171,12 +196,7 @@ async function runVotingAgentInstance(
     next_run: task.next_run,
   }));
 
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    taskRows,
-    invocation.runtime.ipcDir,
-  );
+  writeTasksSnapshot(group.folder, isMain, taskRows, invocation.runtime.ipcDir);
   writeGroupsSnapshot(
     group.folder,
     isMain,
@@ -215,7 +235,7 @@ async function runVotingAgentInstance(
           instanceId: invocation.instanceId,
           containerName,
         },
-        'Voting worker did not exit after close signal, stopping container',
+        'Orchestrated agent did not exit after close signal, stopping container',
       );
       exec(stopContainer(containerName), { timeout: 15_000 }, (stopErr) => {
         if (stopErr) {
@@ -226,15 +246,16 @@ async function runVotingAgentInstance(
               containerName,
               err: stopErr,
             },
-            'Failed to stop voting worker container',
+            'Failed to stop orchestrated agent container',
           );
         }
       });
-    }, VOTING_CLOSE_GRACE_MS);
+    }, ORCHESTRATION_CLOSE_GRACE_MS);
   };
 
-  let resolveFirstResult: ((result: VotingAgentResult) => void) | null = null;
-  const firstResultPromise = new Promise<VotingAgentResult>((resolve) => {
+  let resolveFirstResult: ((result: OrchestratedAgentResult) => void) | null =
+    null;
+  const firstResultPromise = new Promise<OrchestratedAgentResult>((resolve) => {
     resolveFirstResult = resolve;
   });
 
@@ -322,10 +343,7 @@ async function runVotingAgentInstance(
     });
 
   try {
-    const result = await Promise.race([
-      firstResultPromise,
-      containerPromise,
-    ]);
+    const result = await Promise.race([firstResultPromise, containerPromise]);
 
     // Keep draining the container promise in the background so cleanup/logging
     // can finish even if we already returned on the first result.
@@ -406,14 +424,79 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, true);
 
+  if (isPlannerModeEnabled(group)) {
+    const plannerResult = await runPlannerMode({
+      group,
+      prompt,
+      chatJid,
+      deps: {
+        runInstance: async (invocation: PlannerAgentInvocation) => {
+          const result = await runOrchestratedAgentInstance(
+            group,
+            chatJid,
+            invocation,
+          );
+          return {
+            instanceId: result.instanceId,
+            role: invocation.role,
+            status: result.status,
+            result: result.result,
+            error: result.error,
+          } satisfies PlannerAgentResult;
+        },
+      },
+    });
+
+    await channel.setTyping?.(chatJid, false);
+
+    if (plannerResult.status === 'success' && plannerResult.finalResult) {
+      await channel.sendMessage(chatJid, plannerResult.finalResult);
+      logger.info(
+        {
+          group: group.name,
+          runId: plannerResult.runId,
+          archiveDir: plannerResult.archiveDir,
+          plannedAgentCount: plannerResult.plan?.agents.length || 0,
+        },
+        'Planner-mode run completed',
+      );
+      return true;
+    }
+
+    lastAgentTimestamp[chatJid] = previousCursor;
+    saveState();
+    logger.warn(
+      {
+        group: group.name,
+        runId: plannerResult.runId,
+        archiveDir: plannerResult.archiveDir,
+        error: plannerResult.error,
+      },
+      'Planner-mode run failed, rolled back message cursor for retry',
+    );
+    return false;
+  }
+
   if (isVotingModeEnabled(group)) {
     const votingResult = await runVotingMode({
       group,
       prompt,
       chatJid,
       deps: {
-        runInstance: (invocation) =>
-          runVotingAgentInstance(group, chatJid, invocation),
+        runInstance: async (invocation: VotingAgentInvocation) => {
+          const result = await runOrchestratedAgentInstance(
+            group,
+            chatJid,
+            invocation,
+          );
+          return {
+            instanceId: result.instanceId,
+            role: invocation.role,
+            status: result.status,
+            result: result.result,
+            error: result.error,
+          } satisfies VotingAgentResult;
+        },
       },
     });
 

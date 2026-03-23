@@ -244,9 +244,7 @@ describe('container-runner timeout behavior', () => {
     const spawnMock = vi.mocked(spawn);
     expect(spawnMock).toHaveBeenCalled();
     const [, containerArgs] = spawnMock.mock.calls[0];
-    expect(containerArgs).toContain(
-      `${runtime.sessionDir}:/home/node/.claude`,
-    );
+    expect(containerArgs).toContain(`${runtime.sessionDir}:/home/node/.claude`);
     expect(containerArgs).toContain(`${runtime.ipcDir}:/workspace/ipc`);
     expect(containerArgs).toContain(`${runtime.agentRunnerSrcDir}:/app/src`);
     expect(containerArgs).toContain('-e');

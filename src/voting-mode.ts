@@ -38,7 +38,9 @@ export interface VotingAgentResult {
 }
 
 export interface VotingModeDeps {
-  runInstance: (invocation: VotingAgentInvocation) => Promise<VotingAgentResult>;
+  runInstance: (
+    invocation: VotingAgentInvocation,
+  ) => Promise<VotingAgentResult>;
 }
 
 export interface VotingModeResult {
@@ -56,7 +58,9 @@ function isLikelyChinese(text: string): boolean {
   return HAN_SCRIPT_REGEX.test(text);
 }
 
-function extractWorkerCandidate(result: string | null | undefined): string | null {
+function extractWorkerCandidate(
+  result: string | null | undefined,
+): string | null {
   if (!result) return null;
 
   const lines = result
@@ -180,7 +184,7 @@ export function buildAggregatorPrompt(
 
   return [
     'You are the aggregator in a voting-style multi-agent run inside NanoClaw.',
-    'Your job is to first list each runner\'s proposed answer clearly, then produce one voted final answer for the user.',
+    "Your job is to first list each runner's proposed answer clearly, then produce one voted final answer for the user.",
     'Prefer correctness, specificity, and usefulness over consensus.',
     'Do not open with "multiple answers are reasonable" before you enumerate the runners.',
     'If the workers disagree, resolve the conflict and briefly note uncertainty only when it materially matters.',
@@ -361,7 +365,11 @@ export async function runVotingMode(args: {
       return {
         instanceId,
         role: 'worker',
-        prompt: buildVotingWorkerPrompt(prompt, workerNumber, config.workerCount),
+        prompt: buildVotingWorkerPrompt(
+          prompt,
+          workerNumber,
+          config.workerCount,
+        ),
         runtime: createAgentInstanceRuntime(
           group.folder,
           runId,
