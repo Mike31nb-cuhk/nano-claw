@@ -669,10 +669,9 @@ function archivePlannerRun(args: {
           round.workerInvocations.length > 0 ||
           round.aggregatorInvocation,
       ) || args.rounds[args.rounds.length - 1];
-  const successfulWorkers =
-    args.rounds.flatMap((round) => round.workerResults).filter(
-      (result) => result.status === 'success' && result.result,
-    ).length;
+  const successfulWorkers = args.rounds
+    .flatMap((round) => round.workerResults)
+    .filter((result) => result.status === 'success' && result.result).length;
 
   writePlannerArchiveJson(archiveDir, 'request.json', {
     runId: args.runId,
@@ -747,7 +746,10 @@ function archivePlannerRun(args: {
     });
   }
 
-  if (lastExecutedRound?.aggregatorInvocation || lastExecutedRound?.aggregatorResult) {
+  if (
+    lastExecutedRound?.aggregatorInvocation ||
+    lastExecutedRound?.aggregatorResult
+  ) {
     writePlannerArchiveJson(archiveDir, 'aggregator.json', {
       runId: args.runId,
       round: lastExecutedRound?.round || null,
@@ -1008,31 +1010,31 @@ export async function runPlannerMode(args: {
     }
 
     roundRecord.plan = plan;
-    const workerInvocations: PlannerAgentInvocation[] = (plan?.agents || []).map(
-      (agent, index) => {
-        const instanceId =
-          iterativeMode && config.maxRounds > 1
-            ? `round-${round}-${agent.instanceId}`
-            : agent.instanceId;
-        return {
+    const workerInvocations: PlannerAgentInvocation[] = (
+      plan?.agents || []
+    ).map((agent, index) => {
+      const instanceId =
+        iterativeMode && config.maxRounds > 1
+          ? `round-${round}-${agent.instanceId}`
+          : agent.instanceId;
+      return {
+        instanceId,
+        role: 'worker',
+        prompt: buildPlannerWorkerPrompt(
+          prompt,
+          agent,
+          index + 1,
+          plan?.agents.length || 0,
+        ),
+        runtime: createAgentInstanceRuntime(
+          group.folder,
+          runId,
           instanceId,
-          role: 'worker',
-          prompt: buildPlannerWorkerPrompt(
-            prompt,
-            agent,
-            index + 1,
-            plan?.agents.length || 0,
-          ),
-          runtime: createAgentInstanceRuntime(
-            group.folder,
-            runId,
-            instanceId,
-            config.workerModel,
-          ),
-          planAgent: agent,
-        };
-      },
-    );
+          config.workerModel,
+        ),
+        planAgent: agent,
+      };
+    });
     roundRecord.workerInvocations = workerInvocations;
 
     const settledWorkers = await Promise.allSettled(
@@ -1116,7 +1118,8 @@ export async function runPlannerMode(args: {
     rounds.push(roundRecord);
 
     if (aggregatorResult.status !== 'success' || !aggregatorResult.result) {
-      const error = aggregatorResult.error || 'Planner-mode aggregation failed.';
+      const error =
+        aggregatorResult.error || 'Planner-mode aggregation failed.';
       archivePlannerRun({
         group,
         chatJid,
