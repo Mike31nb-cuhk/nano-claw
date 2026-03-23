@@ -47,6 +47,7 @@ export interface PlannerConfig {
   enabled?: boolean;
   maxAgents?: number;
   fixedAgents?: number;
+  maxRounds?: number;
   plannerModel?: string;
   workerModel?: string;
   aggregatorModel?: string;
