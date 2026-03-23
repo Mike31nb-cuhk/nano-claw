@@ -1,3 +1,5 @@
+import { exec } from 'child_process';
+
 import fs from 'fs';
 import path from 'path';
 
@@ -18,6 +20,7 @@ import {
 import {
   ContainerOutput,
   runContainerAgent,
+  writeContainerCloseSignal,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -25,6 +28,7 @@ import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
+  stopContainer,
 } from './container-runtime.js';
 import {
   getAllChats,
@@ -59,6 +63,11 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  runVotingMode,
+  VotingAgentInvocation,
+  VotingAgentResult,
+} from './voting-mode.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -137,6 +146,207 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
     }));
 }
 
+function stripInternalOutput(raw: string): string {
+  return raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+}
+
+function isVotingModeEnabled(group: RegisteredGroup): boolean {
+  return group.containerConfig?.voting?.enabled === true;
+}
+
+async function runVotingAgentInstance(
+  group: RegisteredGroup,
+  chatJid: string,
+  invocation: VotingAgentInvocation,
+): Promise<VotingAgentResult> {
+  const VOTING_CLOSE_GRACE_MS = 10_000;
+  const isMain = group.isMain === true;
+  const taskRows = getAllTasks().map((task) => ({
+    id: task.id,
+    groupFolder: task.group_folder,
+    prompt: task.prompt,
+    schedule_type: task.schedule_type,
+    schedule_value: task.schedule_value,
+    status: task.status,
+    next_run: task.next_run,
+  }));
+
+  writeTasksSnapshot(
+    group.folder,
+    isMain,
+    taskRows,
+    invocation.runtime.ipcDir,
+  );
+  writeGroupsSnapshot(
+    group.folder,
+    isMain,
+    getAvailableGroups(),
+    new Set(Object.keys(registeredGroups)),
+    invocation.runtime.ipcDir,
+  );
+
+  let firstResult: string | null = null;
+  let error: string | undefined;
+  let closeRequested = false;
+  let containerCompleted = false;
+  let containerName: string | null = null;
+  let forceStopTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearForceStopTimer = () => {
+    if (forceStopTimer) {
+      clearTimeout(forceStopTimer);
+      forceStopTimer = null;
+    }
+  };
+
+  const requestClose = () => {
+    if (closeRequested) return;
+    closeRequested = true;
+    writeContainerCloseSignal(invocation.runtime.ipcDir);
+  };
+
+  const scheduleForceStop = () => {
+    if (forceStopTimer || containerCompleted) return;
+    forceStopTimer = setTimeout(() => {
+      if (containerCompleted || !containerName) return;
+      logger.warn(
+        {
+          group: group.name,
+          instanceId: invocation.instanceId,
+          containerName,
+        },
+        'Voting worker did not exit after close signal, stopping container',
+      );
+      exec(stopContainer(containerName), { timeout: 15_000 }, (stopErr) => {
+        if (stopErr) {
+          logger.warn(
+            {
+              group: group.name,
+              instanceId: invocation.instanceId,
+              containerName,
+              err: stopErr,
+            },
+            'Failed to stop voting worker container',
+          );
+        }
+      });
+    }, VOTING_CLOSE_GRACE_MS);
+  };
+
+  let resolveFirstResult: ((result: VotingAgentResult) => void) | null = null;
+  const firstResultPromise = new Promise<VotingAgentResult>((resolve) => {
+    resolveFirstResult = resolve;
+  });
+
+  const containerPromise = runContainerAgent(
+    group,
+    {
+      prompt: invocation.prompt,
+      groupFolder: group.folder,
+      chatJid,
+      isMain,
+      assistantName: ASSISTANT_NAME,
+      runId: invocation.runtime.runId,
+      agentInstanceId: invocation.instanceId,
+      agentRole: invocation.role,
+    },
+    (_proc, spawnedContainerName) => {
+      containerName = spawnedContainerName;
+    },
+    async (streamedOutput: ContainerOutput) => {
+      if (!firstResult && streamedOutput.result) {
+        const text = stripInternalOutput(streamedOutput.result);
+        if (text) {
+          firstResult = text;
+          requestClose();
+          scheduleForceStop();
+          resolveFirstResult?.({
+            instanceId: invocation.instanceId,
+            role: invocation.role,
+            status: 'success',
+            result: firstResult,
+          });
+          resolveFirstResult = null;
+        }
+      }
+
+      if (streamedOutput.status === 'error') {
+        error = streamedOutput.error || 'Unknown error';
+      }
+    },
+    invocation.runtime,
+  )
+    .then((output) => {
+      containerCompleted = true;
+      clearForceStopTimer();
+
+      if (!firstResult && output.result) {
+        const text = stripInternalOutput(output.result);
+        if (text) {
+          firstResult = text;
+        }
+      }
+
+      if (output.status === 'error') {
+        error = output.error || 'Unknown error';
+      }
+
+      if (firstResult) {
+        return {
+          instanceId: invocation.instanceId,
+          role: invocation.role,
+          status: 'success' as const,
+          result: firstResult,
+        };
+      }
+
+      return {
+        instanceId: invocation.instanceId,
+        role: invocation.role,
+        status: 'error' as const,
+        result: null,
+        error: error || `${invocation.instanceId} produced no usable output`,
+      };
+    })
+    .catch((err) => {
+      containerCompleted = true;
+      clearForceStopTimer();
+      error = err instanceof Error ? err.message : String(err);
+      return {
+        instanceId: invocation.instanceId,
+        role: invocation.role,
+        status: 'error' as const,
+        result: null,
+        error,
+      };
+    });
+
+  try {
+    const result = await Promise.race([
+      firstResultPromise,
+      containerPromise,
+    ]);
+
+    // Keep draining the container promise in the background so cleanup/logging
+    // can finish even if we already returned on the first result.
+    void containerPromise;
+
+    return result;
+  } catch (err) {
+    containerCompleted = true;
+    clearForceStopTimer();
+    error = err instanceof Error ? err.message : String(err);
+  }
+
+  return {
+    instanceId: invocation.instanceId,
+    role: invocation.role,
+    status: 'error',
+    result: null,
+    error: error || `${invocation.instanceId} produced no usable output`,
+  };
+}
+
 /** @internal - exported for testing */
 export function _setRegisteredGroups(
   groups: Record<string, RegisteredGroup>,
@@ -194,6 +404,50 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  await channel.setTyping?.(chatJid, true);
+
+  if (isVotingModeEnabled(group)) {
+    const votingResult = await runVotingMode({
+      group,
+      prompt,
+      chatJid,
+      deps: {
+        runInstance: (invocation) =>
+          runVotingAgentInstance(group, chatJid, invocation),
+      },
+    });
+
+    await channel.setTyping?.(chatJid, false);
+
+    if (votingResult.status === 'success' && votingResult.finalResult) {
+      await channel.sendMessage(chatJid, votingResult.finalResult);
+      logger.info(
+        {
+          group: group.name,
+          runId: votingResult.runId,
+          archiveDir: votingResult.archiveDir,
+          workerCount: votingResult.workerResults.length,
+          usedFallback: votingResult.usedFallback,
+        },
+        'Voting-mode run completed',
+      );
+      return true;
+    }
+
+    lastAgentTimestamp[chatJid] = previousCursor;
+    saveState();
+    logger.warn(
+      {
+        group: group.name,
+        runId: votingResult.runId,
+        archiveDir: votingResult.archiveDir,
+        error: votingResult.error,
+      },
+      'Voting-mode run failed, rolled back message cursor for retry',
+    );
+    return false;
+  }
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -208,7 +462,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 

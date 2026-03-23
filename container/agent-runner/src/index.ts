@@ -27,6 +27,9 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  runId?: string;
+  agentInstanceId?: string;
+  agentRole?: string;
 }
 
 interface ContainerOutput {
@@ -57,6 +60,13 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+let ipcInputAccessWarningLogged = false;
+
+function isIgnorableIpcError(err: unknown): boolean {
+  if (!(err instanceof Error) || !('code' in err)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'EPERM' || code === 'EACCES';
+}
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -275,7 +285,9 @@ function shouldClose(): boolean {
  */
 function drainIpcInput(): string[] {
   try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+    if (!fs.existsSync(IPC_INPUT_DIR)) {
+      return [];
+    }
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();
@@ -296,6 +308,13 @@ function drainIpcInput(): string[] {
     }
     return messages;
   } catch (err) {
+    if (isIgnorableIpcError(err)) {
+      if (!ipcInputAccessWarningLogged) {
+        ipcInputAccessWarningLogged = true;
+        log(`IPC input temporarily unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return [];
+    }
     log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
@@ -363,6 +382,7 @@ async function runQuery(
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
+  let lastNonEmptyAssistantText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -439,7 +459,11 @@ async function runQuery(
       const content = msg.message?.content;
       if (Array.isArray(content)) {
         const texts = content.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text);
-        log(`Assistant content (${content.length} blocks): ${texts.join('').slice(0, 300)}`);
+        const assistantText = texts.join('');
+        if (assistantText.trim()) {
+          lastNonEmptyAssistantText = assistantText;
+        }
+        log(`Assistant content (${content.length} blocks): ${assistantText.slice(0, 300)}`);
       }
     }
 
@@ -456,10 +480,15 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype} keys=${Object.keys(message).join(',')}${textResult ? ` text=${textResult.slice(0, 200)}` : ' (no text)'}`);
+      const outputText = textResult || lastNonEmptyAssistantText || null;
+      if (!textResult && outputText) {
+        log(`Result #${resultCount}: subtype=${message.subtype} keys=${Object.keys(message).join(',')} (using assistant-text fallback)`);
+      } else {
+        log(`Result #${resultCount}: subtype=${message.subtype} keys=${Object.keys(message).join(',')}${textResult ? ` text=${textResult.slice(0, 200)}` : ' (no text)'}`);
+      }
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: outputText,
         newSessionId
       });
     }
@@ -495,7 +524,17 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
-  fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  } catch (err) {
+    if (!isIgnorableIpcError(err)) {
+      throw err;
+    }
+    if (!ipcInputAccessWarningLogged) {
+      ipcInputAccessWarningLogged = true;
+      log(`IPC input unavailable during startup: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   // Clean up stale _close sentinel from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }

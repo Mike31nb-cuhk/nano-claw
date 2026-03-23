@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
+import { spawn } from 'child_process';
 
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -42,6 +43,7 @@ vi.mock('fs', async () => {
       readdirSync: vi.fn(() => []),
       statSync: vi.fn(() => ({ isDirectory: () => false })),
       copyFileSync: vi.fn(),
+      cpSync: vi.fn(),
     },
   };
 });
@@ -86,7 +88,11 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  createAgentInstanceRuntime,
+  runContainerAgent,
+  ContainerOutput,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -114,6 +120,7 @@ function emitOutputMarker(
 describe('container-runner timeout behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.clearAllMocks();
     fakeProc = createFakeProcess();
   });
 
@@ -206,5 +213,43 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+
+  it('uses instance runtime paths and model override when provided', async () => {
+    const runtime = createAgentInstanceRuntime(
+      'test-group',
+      'run-123',
+      'worker-1',
+      'claude-opus-test',
+    );
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      undefined,
+      runtime,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-789',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const spawnMock = vi.mocked(spawn);
+    expect(spawnMock).toHaveBeenCalled();
+    const [, containerArgs] = spawnMock.mock.calls[0];
+    expect(containerArgs).toContain(
+      `${runtime.sessionDir}:/home/node/.claude`,
+    );
+    expect(containerArgs).toContain(`${runtime.ipcDir}:/workspace/ipc`);
+    expect(containerArgs).toContain(`${runtime.agentRunnerSrcDir}:/app/src`);
+    expect(containerArgs).toContain('-e');
+    expect(containerArgs).toContain('CLAUDE_MODEL=claude-opus-test');
   });
 });

@@ -42,6 +42,9 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  runId?: string;
+  agentInstanceId?: string;
+  agentRole?: string;
 }
 
 export interface ContainerOutput {
@@ -57,9 +60,51 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+export interface AgentInstanceRuntime {
+  instanceId: string;
+  runId: string;
+  sessionDir: string;
+  ipcDir: string;
+  agentRunnerSrcDir: string;
+  model?: string;
+}
+
+export function createAgentInstanceRuntime(
+  groupFolder: string,
+  runId: string,
+  instanceId: string,
+  model?: string,
+): AgentInstanceRuntime {
+  return {
+    instanceId,
+    runId,
+    sessionDir: path.join(
+      DATA_DIR,
+      'sessions',
+      groupFolder,
+      'runs',
+      runId,
+      instanceId,
+      '.claude',
+    ),
+    ipcDir: path.join(DATA_DIR, 'ipc', groupFolder, 'runs', runId, instanceId),
+    agentRunnerSrcDir: path.join(
+      DATA_DIR,
+      'sessions',
+      groupFolder,
+      'runs',
+      runId,
+      instanceId,
+      'agent-runner-src',
+    ),
+    model,
+  };
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  runtime?: AgentInstanceRuntime,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -109,12 +154,9 @@ function buildVolumeMounts(
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  const groupSessionsDir =
+    runtime?.sessionDir ||
+    path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
@@ -159,7 +201,7 @@ function buildVolumeMounts(
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const groupIpcDir = runtime?.ipcDir || resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
@@ -178,12 +220,9 @@ function buildVolumeMounts(
     'agent-runner',
     'src',
   );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
+  const groupAgentRunnerDir =
+    runtime?.agentRunnerSrcDir ||
+    path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
@@ -210,6 +249,7 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   isMain: boolean,
+  modelOverride?: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -224,8 +264,9 @@ function buildContainerArgs(
 
   // Pass the model so the SDK uses the correct one via the proxy
   const envSecrets = readEnvFile(['CLAUDE_MODEL']);
-  if (envSecrets.CLAUDE_MODEL) {
-    args.push('-e', `CLAUDE_MODEL=${envSecrets.CLAUDE_MODEL}`);
+  const selectedModel = modelOverride || envSecrets.CLAUDE_MODEL;
+  if (selectedModel) {
+    args.push('-e', `CLAUDE_MODEL=${selectedModel}`);
   }
 
   // Mirror the host's auth method with a placeholder value.
@@ -277,16 +318,25 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  runtime?: AgentInstanceRuntime,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, runtime);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
+  const runtimeSuffix = runtime?.instanceId
+    ? runtime.instanceId.replace(/[^a-zA-Z0-9-]/g, '-')
+    : `${Date.now()}`;
+  const containerName = `nanoclaw-${safeName}-${runtimeSuffix}-${Date.now()}`;
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    input.isMain,
+    runtime?.model || group.containerConfig?.model,
+  );
 
   logger.debug(
     {
@@ -662,9 +712,10 @@ export function writeTasksSnapshot(
     status: string;
     next_run: string | null;
   }>,
+  ipcDirOverride?: string,
 ): void {
   // Write filtered tasks to the group's IPC directory
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const groupIpcDir = ipcDirOverride || resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Main sees all tasks, others only see their own
@@ -693,8 +744,9 @@ export function writeGroupsSnapshot(
   isMain: boolean,
   groups: AvailableGroup[],
   registeredJids: Set<string>,
+  ipcDirOverride?: string,
 ): void {
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const groupIpcDir = ipcDirOverride || resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Main sees all groups; others see nothing (they can't activate groups)
@@ -712,4 +764,10 @@ export function writeGroupsSnapshot(
       2,
     ),
   );
+}
+
+export function writeContainerCloseSignal(ipcDir: string): void {
+  const inputDir = path.join(ipcDir, 'input');
+  fs.mkdirSync(inputDir, { recursive: true });
+  fs.writeFileSync(path.join(inputDir, '_close'), '');
 }
