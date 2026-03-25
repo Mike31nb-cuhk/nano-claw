@@ -208,11 +208,17 @@ export function buildPeerDiscussionAggregatorPrompt(
   ].join('\n');
 }
 
-function getPeerDiscussionArchiveDir(groupFolder: string, runId: string): string {
+function getPeerDiscussionArchiveDir(
+  groupFolder: string,
+  runId: string,
+): string {
   return path.join(resolveGroupIpcPath(groupFolder), 'runs', runId, 'results');
 }
 
-function getPeerDiscussionSharedDir(groupFolder: string, runId: string): string {
+function getPeerDiscussionSharedDir(
+  groupFolder: string,
+  runId: string,
+): string {
   return path.join(
     resolveGroupIpcPath(groupFolder),
     'runs',
@@ -338,7 +344,9 @@ export async function runPeerDiscussionMode(args: {
   deps: PeerDiscussionModeDeps;
 }): Promise<PeerDiscussionModeResult> {
   const { group, prompt, chatJid, deps } = args;
-  const config = resolvePeerDiscussionConfig(group.containerConfig?.peerDiscussion);
+  const config = resolvePeerDiscussionConfig(
+    group.containerConfig?.peerDiscussion,
+  );
   const runId = createPeerDiscussionRunId();
   const archiveDir = getPeerDiscussionArchiveDir(group.folder, runId);
   const peerDiscussionDir = getPeerDiscussionSharedDir(group.folder, runId);

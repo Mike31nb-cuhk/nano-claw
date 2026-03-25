@@ -84,20 +84,23 @@ describe('peer-discussion-mode helpers', () => {
     expect(workerPrompt).toContain('60 seconds');
     expect(workerPrompt).toContain('mcp__nanoclaw__send_peer_message');
 
-    const aggregatorPrompt = buildPeerDiscussionAggregatorPrompt('Original task', [
-      {
-        instanceId: 'worker-1',
-        role: 'discussion-worker',
-        status: 'success',
-        result: 'Candidate: A\nExplanation A',
-      },
-      {
-        instanceId: 'worker-2',
-        role: 'discussion-worker',
-        status: 'success',
-        result: 'Candidate: B\nExplanation B',
-      },
-    ]);
+    const aggregatorPrompt = buildPeerDiscussionAggregatorPrompt(
+      'Original task',
+      [
+        {
+          instanceId: 'worker-1',
+          role: 'discussion-worker',
+          status: 'success',
+          result: 'Candidate: A\nExplanation A',
+        },
+        {
+          instanceId: 'worker-2',
+          role: 'discussion-worker',
+          status: 'success',
+          result: 'Candidate: B\nExplanation B',
+        },
+      ],
+    );
     expect(aggregatorPrompt).toContain('Original task');
     expect(aggregatorPrompt).toContain('Discussion Convergence');
     expect(aggregatorPrompt).toContain('Final Answer');
@@ -232,7 +235,9 @@ describe('runPeerDiscussionMode', () => {
 
     expect(result.status).toBe('success');
     expect(result.usedFallback).toBe(true);
-    expect(result.finalResult).toContain('longest peer-discussion final answer');
+    expect(result.finalResult).toContain(
+      'longest peer-discussion final answer',
+    );
     expect(result.error).toBe('aggregator failed');
   });
 });
