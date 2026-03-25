@@ -45,6 +45,14 @@ export interface ContainerInput {
   runId?: string;
   agentInstanceId?: string;
   agentRole?: string;
+  interactionMode?: 'default' | 'peer-discussion';
+  peerDiscussion?: {
+    agentId: string;
+    peers: string[];
+    maxRounds: number;
+    discussionWindowMs?: number;
+    roundTimeoutMs?: number;
+  };
 }
 
 export interface ContainerOutput {
@@ -67,6 +75,7 @@ export interface AgentInstanceRuntime {
   ipcDir: string;
   agentRunnerSrcDir: string;
   model?: string;
+  peerDiscussionDir?: string;
 }
 
 export function createAgentInstanceRuntime(
@@ -74,6 +83,7 @@ export function createAgentInstanceRuntime(
   runId: string,
   instanceId: string,
   model?: string,
+  peerDiscussionDir?: string,
 ): AgentInstanceRuntime {
   return {
     instanceId,
@@ -98,6 +108,7 @@ export function createAgentInstanceRuntime(
       'agent-runner-src',
     ),
     model,
+    peerDiscussionDir,
   };
 }
 
@@ -231,6 +242,15 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  if (runtime?.peerDiscussionDir) {
+    fs.mkdirSync(runtime.peerDiscussionDir, { recursive: true });
+    mounts.push({
+      hostPath: runtime.peerDiscussionDir,
+      containerPath: '/workspace/peer-discussion',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {

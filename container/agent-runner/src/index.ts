@@ -30,6 +30,14 @@ interface ContainerInput {
   runId?: string;
   agentInstanceId?: string;
   agentRole?: string;
+  interactionMode?: 'default' | 'peer-discussion';
+  peerDiscussion?: {
+    agentId: string;
+    peers: string[];
+    maxRounds: number;
+    discussionWindowMs?: number;
+    roundTimeoutMs?: number;
+  };
 }
 
 interface ContainerOutput {
@@ -60,12 +68,124 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const PEER_DISCUSSION_DIR = '/workspace/peer-discussion';
 let ipcInputAccessWarningLogged = false;
 
 function isIgnorableIpcError(err: unknown): boolean {
   if (!(err instanceof Error) || !('code' in err)) return false;
   const code = (err as NodeJS.ErrnoException).code;
   return code === 'ENOENT' || code === 'EPERM' || code === 'EACCES';
+}
+
+function isPeerDiscussionMode(
+  containerInput: ContainerInput,
+): containerInput is ContainerInput & {
+  interactionMode: 'peer-discussion';
+  peerDiscussion: {
+    agentId: string;
+    peers: string[];
+    maxRounds: number;
+    discussionWindowMs?: number;
+    roundTimeoutMs?: number;
+  };
+} {
+  return (
+    containerInput.interactionMode === 'peer-discussion' &&
+    !!containerInput.peerDiscussion
+  );
+}
+
+function getPeerInboxDir(agentId: string): string {
+  return path.join(PEER_DISCUSSION_DIR, 'inbox', agentId);
+}
+
+function formatPeerMessage(data: {
+  fromAgentId?: string;
+  text?: string;
+  timestamp?: string;
+}): string | null {
+  if (!data.text) return null;
+  const from = data.fromAgentId || 'peer';
+  return `[Peer ${from}] ${data.text}`;
+}
+
+function drainPeerInbox(agentId: string): string[] {
+  const inboxDir = getPeerInboxDir(agentId);
+  try {
+    if (!fs.existsSync(inboxDir)) {
+      return [];
+    }
+
+    const files = fs.readdirSync(inboxDir)
+      .filter((f) => f.endsWith('.json'))
+      .sort();
+
+    const messages: string[] = [];
+    for (const file of files) {
+      const filePath = path.join(inboxDir, file);
+      const processingDir = path.join(inboxDir, '_processing');
+      fs.mkdirSync(processingDir, { recursive: true });
+      const claimedPath = path.join(processingDir, file);
+      try {
+        fs.renameSync(filePath, claimedPath);
+      } catch (err) {
+        if (isIgnorableIpcError(err)) continue;
+        throw err;
+      }
+
+      try {
+        const data = JSON.parse(fs.readFileSync(claimedPath, 'utf-8'));
+        const formatted = formatPeerMessage(data);
+        if (formatted) {
+          messages.push(formatted);
+        }
+      } catch (err) {
+        log(
+          `Failed to process peer message ${file}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        try {
+          fs.unlinkSync(claimedPath);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    return messages;
+  } catch (err) {
+    if (isIgnorableIpcError(err)) {
+      return [];
+    }
+    log(`Peer inbox drain error: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+function waitForPeerMessages(
+  agentId: string,
+  timeoutMs: number,
+): Promise<string[] | null> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const poll = () => {
+      if (shouldClose()) {
+        resolve(null);
+        return;
+      }
+      const messages = drainPeerInbox(agentId);
+      if (messages.length > 0) {
+        resolve(messages);
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        resolve([]);
+        return;
+      }
+      setTimeout(poll, IPC_POLL_MS);
+    };
+    poll();
+  });
 }
 
 /**
@@ -153,7 +273,11 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
  * Archive the full transcript to conversations/ before compaction.
  */
 function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
+  return async (
+    input: unknown,
+    _toolUseId: string | undefined,
+    _context: unknown,
+  ) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
     const sessionId = preCompact.session_id;
@@ -355,13 +479,19 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  emitResult = true,
+  discussionWindow?: {
+    windowMs: number;
+    closePrompt: string;
+  },
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; lastOutputText?: string }> {
   const stream = new MessageStream();
   stream.push(prompt);
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+  let discussionWindowClosed = discussionWindow === undefined;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
@@ -376,13 +506,36 @@ async function runQuery(
       log(`Piping IPC message into active query (${text.length} chars)`);
       stream.push(text);
     }
+    if (isPeerDiscussionMode(containerInput) && !discussionWindowClosed) {
+      const peerMessages = drainPeerInbox(containerInput.peerDiscussion.agentId);
+      for (const text of peerMessages) {
+        log(`Piping peer message into active query (${text.length} chars)`);
+        stream.push(text);
+      }
+    }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
+  let discussionWindowTimer: ReturnType<typeof setTimeout> | null = null;
+  if (discussionWindow && discussionWindow.windowMs > 0) {
+    discussionWindowTimer = setTimeout(() => {
+      if (!ipcPolling || discussionWindowClosed || closedDuringQuery) {
+        return;
+      }
+      discussionWindowClosed = true;
+      log(
+        `Peer discussion window expired after ${discussionWindow.windowMs}ms; closing round input`,
+      );
+      stream.push(discussionWindow.closePrompt);
+      stream.end();
+    }, discussionWindow.windowMs);
+  }
+
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let lastNonEmptyAssistantText: string | undefined;
+  let lastOutputText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -441,6 +594,12 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_INTERACTION_MODE: containerInput.interactionMode || 'default',
+            NANOCLAW_AGENT_INSTANCE_ID: containerInput.agentInstanceId || '',
+            NANOCLAW_PEER_DISCUSSION_DIR: PEER_DISCUSSION_DIR,
+            NANOCLAW_PEER_LIST: JSON.stringify(
+              containerInput.peerDiscussion?.peers || [],
+            ),
           },
         },
       },
@@ -486,17 +645,135 @@ async function runQuery(
       } else {
         log(`Result #${resultCount}: subtype=${message.subtype} keys=${Object.keys(message).join(',')}${textResult ? ` text=${textResult.slice(0, 200)}` : ' (no text)'}`);
       }
-      writeOutput({
-        status: 'success',
-        result: outputText,
-        newSessionId
-      });
+      lastOutputText = outputText || undefined;
+      if (emitResult) {
+        writeOutput({
+          status: 'success',
+          result: outputText,
+          newSessionId
+        });
+      }
     }
   }
 
   ipcPolling = false;
+  if (discussionWindowTimer) {
+    clearTimeout(discussionWindowTimer);
+  }
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, lastOutputText };
+}
+
+function buildPeerDiscussionContinuationPrompt(args: {
+  round: number;
+  maxRounds: number;
+  peerMessages: string[];
+}): string {
+  const { round, maxRounds, peerMessages } = args;
+  return [
+    `Continue the same peer discussion. This is round ${round} of ${maxRounds}.`,
+    'Review the peer feedback below, refine your view, and continue improving your answer.',
+    'If you discover a materially useful new point, use `mcp__nanoclaw__send_peer_message` to share a concise update with peers.',
+    round === maxRounds
+      ? 'This is the final round. Return your strongest standalone final answer.'
+      : 'This is not the final round yet. Keep your answer sharp and discussion-oriented.',
+    '',
+    peerMessages.length > 0
+      ? 'Peer feedback:\n' + peerMessages.join('\n')
+      : 'No new peer feedback arrived within the wait window. Continue refining independently.',
+  ].join('\n');
+}
+
+function buildPeerDiscussionWindowClosePrompt(args: {
+  round: number;
+  maxRounds: number;
+}): string {
+  const { round, maxRounds } = args;
+  return [
+    `The live peer-discussion window for round ${round} of ${maxRounds} has closed.`,
+    'Do not wait for more peer feedback in this round.',
+    round === maxRounds
+      ? 'Return your strongest standalone final answer now.'
+      : 'Return your current strongest answer for this round now. Another discussion round may follow.',
+  ].join(' ');
+}
+
+async function runPeerDiscussionLoop(
+  initialPrompt: string,
+  sessionId: string | undefined,
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+  sdkEnv: Record<string, string | undefined>,
+): Promise<void> {
+  if (!containerInput.peerDiscussion) {
+    throw new Error('peerDiscussion config is required for peer-discussion mode');
+  }
+
+  const {
+    agentId,
+    maxRounds,
+    discussionWindowMs = 60_000,
+    roundTimeoutMs = 4000,
+  } = containerInput.peerDiscussion;
+  let prompt = initialPrompt;
+  let latestResult: string | undefined;
+
+  for (let round = 1; round <= maxRounds; round++) {
+    log(
+      `Starting peer-discussion round ${round}/${maxRounds} (session: ${sessionId || 'new'})...`,
+    );
+
+    const queryResult = await runQuery(
+      prompt,
+      sessionId,
+      mcpServerPath,
+      containerInput,
+      sdkEnv,
+      undefined,
+      round === maxRounds,
+      {
+        windowMs: discussionWindowMs,
+        closePrompt: buildPeerDiscussionWindowClosePrompt({
+          round,
+          maxRounds,
+        }),
+      },
+    );
+    if (queryResult.newSessionId) {
+      sessionId = queryResult.newSessionId;
+    }
+    if (queryResult.lastOutputText) {
+      latestResult = queryResult.lastOutputText;
+    }
+
+    if (queryResult.closedDuringQuery) {
+      log('Close sentinel consumed during peer-discussion query, exiting');
+      return;
+    }
+
+    if (round === maxRounds) {
+      if (!queryResult.lastOutputText) {
+        writeOutput({
+          status: 'success',
+          result: latestResult || null,
+          newSessionId: sessionId,
+        });
+      }
+      return;
+    }
+
+    const peerMessages = await waitForPeerMessages(agentId, roundTimeoutMs);
+    if (peerMessages === null) {
+      log('Close sentinel received while waiting for peer messages, exiting');
+      return;
+    }
+
+    prompt = buildPeerDiscussionContinuationPrompt({
+      round: round + 1,
+      maxRounds,
+      peerMessages,
+    });
+  }
 }
 
 async function main(): Promise<void> {
@@ -550,9 +827,39 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  if (isPeerDiscussionMode(containerInput)) {
+    try {
+      fs.mkdirSync(getPeerInboxDir(containerInput.peerDiscussion.agentId), {
+        recursive: true,
+      });
+    } catch (err) {
+      if (!isIgnorableIpcError(err)) {
+        throw err;
+      }
+    }
+    const pendingPeerMessages = drainPeerInbox(containerInput.peerDiscussion.agentId);
+    if (pendingPeerMessages.length > 0) {
+      log(
+        `Draining ${pendingPeerMessages.length} pending peer messages into initial prompt`,
+      );
+      prompt += '\n' + pendingPeerMessages.join('\n');
+    }
+  }
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
+    if (isPeerDiscussionMode(containerInput)) {
+      await runPeerDiscussionLoop(
+        prompt,
+        sessionId,
+        mcpServerPath,
+        containerInput,
+        sdkEnv,
+      );
+      return;
+    }
+
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 

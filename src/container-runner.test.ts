@@ -221,6 +221,7 @@ describe('container-runner timeout behavior', () => {
       'run-123',
       'worker-1',
       'claude-opus-test',
+      '/tmp/nanoclaw-test-data/ipc/test-group/runs/run-123/peer-discussion',
     );
     const resultPromise = runContainerAgent(
       testGroup,
@@ -247,6 +248,9 @@ describe('container-runner timeout behavior', () => {
     expect(containerArgs).toContain(`${runtime.sessionDir}:/home/node/.claude`);
     expect(containerArgs).toContain(`${runtime.ipcDir}:/workspace/ipc`);
     expect(containerArgs).toContain(`${runtime.agentRunnerSrcDir}:/app/src`);
+    expect(containerArgs).toContain(
+      `${runtime.peerDiscussionDir}:/workspace/peer-discussion`,
+    );
     expect(containerArgs).toContain('-e');
     expect(containerArgs).toContain('CLAUDE_MODEL=claude-opus-test');
   });

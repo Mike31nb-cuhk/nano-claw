@@ -19,6 +19,16 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+const interactionMode = process.env.NANOCLAW_INTERACTION_MODE || 'default';
+const agentInstanceId = process.env.NANOCLAW_AGENT_INSTANCE_ID || '';
+const peerDiscussionDir = process.env.NANOCLAW_PEER_DISCUSSION_DIR || '';
+const peerList = (() => {
+  try {
+    return JSON.parse(process.env.NANOCLAW_PEER_LIST || '[]') as string[];
+  } catch {
+    return [] as string[];
+  }
+})();
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -34,6 +44,24 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+function writePeerMessage(targetAgentId: string, text: string): string {
+  if (!peerDiscussionDir) {
+    throw new Error('peer-discussion directory is not configured');
+  }
+  const inboxDir = path.join(peerDiscussionDir, 'inbox', targetAgentId);
+  const logsDir = path.join(peerDiscussionDir, 'logs');
+  const payload = {
+    type: 'peer_message',
+    fromAgentId: agentInstanceId,
+    toAgentId: targetAgentId,
+    text,
+    timestamp: new Date().toISOString(),
+  };
+  writeIpcFile(inboxDir, payload);
+  writeIpcFile(logsDir, payload);
+  return targetAgentId;
+}
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
@@ -46,7 +74,7 @@ server.tool(
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
-  async (args) => {
+  async (args: { text: string; sender?: string }) => {
     const data: Record<string, string | undefined> = {
       type: 'message',
       chatJid,
@@ -61,6 +89,65 @@ server.tool(
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
   },
 );
+
+if (interactionMode === 'peer-discussion') {
+  server.tool(
+    'send_peer_message',
+    'Send a concise discussion update to one peer agent or broadcast it to all peers in peer-discussion mode.',
+    {
+      text: z.string().describe('The discussion update to send to peers'),
+      target_agent_id: z
+        .string()
+        .optional()
+        .describe('Optional target peer agent id. When omitted, the message is broadcast to all peers.'),
+    },
+    async (args: { text: string; target_agent_id?: string }) => {
+      if (!agentInstanceId) {
+        return {
+          content: [{ type: 'text' as const, text: 'No agent instance id is available for peer-discussion mode.' }],
+          isError: true,
+        };
+      }
+
+      const targets =
+        args.target_agent_id != null
+          ? [args.target_agent_id]
+          : peerList.filter((peerId) => peerId !== agentInstanceId);
+
+      if (targets.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: 'No peer targets are available.' }],
+          isError: true,
+        };
+      }
+
+      for (const target of targets) {
+        if (!peerList.includes(target)) {
+          return {
+            content: [{ type: 'text' as const, text: `Unknown peer target: ${target}` }],
+            isError: true,
+          };
+        }
+      }
+
+      for (const target of targets) {
+        writePeerMessage(target, args.text);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              targets.length === 1
+                ? `Peer message sent to ${targets[0]}.`
+                : `Peer message broadcast to ${targets.length} peers.`,
+          },
+        ],
+      };
+    },
+  );
+}
 
 server.tool(
   'schedule_task',
@@ -92,7 +179,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     context_mode: z.enum(['group', 'isolated']).default('group').describe('group=runs with chat history and memory, isolated=fresh session (include context in prompt)'),
     target_group_jid: z.string().optional().describe('(Main group only) JID of the group to schedule the task for. Defaults to the current group.'),
   },
-  async (args) => {
+  async (args: {
+    prompt: string;
+    schedule_type: 'cron' | 'interval' | 'once';
+    schedule_value: string;
+    context_mode: 'group' | 'isolated';
+    target_group_jid?: string;
+  }) => {
     // Validate schedule_value before writing IPC
     if (args.schedule_type === 'cron') {
       try {
@@ -194,7 +287,7 @@ server.tool(
   'pause_task',
   'Pause a scheduled task. It will not run until resumed.',
   { task_id: z.string().describe('The task ID to pause') },
-  async (args) => {
+  async (args: { task_id: string }) => {
     const data = {
       type: 'pause_task',
       taskId: args.task_id,
@@ -213,7 +306,7 @@ server.tool(
   'resume_task',
   'Resume a paused task.',
   { task_id: z.string().describe('The task ID to resume') },
-  async (args) => {
+  async (args: { task_id: string }) => {
     const data = {
       type: 'resume_task',
       taskId: args.task_id,
@@ -232,7 +325,7 @@ server.tool(
   'cancel_task',
   'Cancel and delete a scheduled task.',
   { task_id: z.string().describe('The task ID to cancel') },
-  async (args) => {
+  async (args: { task_id: string }) => {
     const data = {
       type: 'cancel_task',
       taskId: args.task_id,
@@ -256,7 +349,12 @@ server.tool(
     schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type'),
     schedule_value: z.string().optional().describe('New schedule value (see schedule_task for format)'),
   },
-  async (args) => {
+  async (args: {
+    task_id: string;
+    prompt?: string;
+    schedule_type?: 'cron' | 'interval' | 'once';
+    schedule_value?: string;
+  }) => {
     // Validate schedule_value if provided
     if (args.schedule_type === 'cron' || (!args.schedule_type && args.schedule_value)) {
       if (args.schedule_value) {
@@ -308,7 +406,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     folder: z.string().describe('Channel-prefixed folder name (e.g., "whatsapp_family-chat", "telegram_dev-team")'),
     trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
   },
-  async (args) => {
+  async (args: { jid: string; name: string; folder: string; trigger: string }) => {
     if (!isMain) {
       return {
         content: [{ type: 'text' as const, text: 'Only the main group can register new groups.' }],

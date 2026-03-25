@@ -70,6 +70,11 @@ import {
   runPlannerMode,
 } from './planner-mode.js';
 import {
+  PeerDiscussionAgentInvocation,
+  PeerDiscussionAgentResult,
+  runPeerDiscussionMode,
+} from './peer-discussion-mode.js';
+import {
   runVotingMode,
   VotingAgentInvocation,
   VotingAgentResult,
@@ -154,14 +159,22 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
 
 interface OrchestratedAgentInvocation {
   instanceId: string;
-  role: 'planner' | 'worker' | 'aggregator';
+  role: 'planner' | 'worker' | 'aggregator' | 'discussion-worker';
   prompt: string;
   runtime: AgentInstanceRuntime;
+  interactionMode?: 'default' | 'peer-discussion';
+  peerDiscussion?: {
+    agentId: string;
+    peers: string[];
+    maxRounds: number;
+    discussionWindowMs?: number;
+    roundTimeoutMs?: number;
+  };
 }
 
 interface OrchestratedAgentResult {
   instanceId: string;
-  role: 'planner' | 'worker' | 'aggregator';
+  role: 'planner' | 'worker' | 'aggregator' | 'discussion-worker';
   status: 'success' | 'error';
   result: string | null;
   error?: string;
@@ -179,12 +192,17 @@ function isVotingModeEnabled(group: RegisteredGroup): boolean {
   return group.containerConfig?.voting?.enabled === true;
 }
 
+function isPeerDiscussionModeEnabled(group: RegisteredGroup): boolean {
+  return group.containerConfig?.peerDiscussion?.enabled === true;
+}
+
 async function runOrchestratedAgentInstance(
   group: RegisteredGroup,
   chatJid: string,
   invocation: OrchestratedAgentInvocation,
 ): Promise<OrchestratedAgentResult> {
   const ORCHESTRATION_CLOSE_GRACE_MS = 10_000;
+  const closeOnFirstResult = invocation.role !== 'discussion-worker';
   const isMain = group.isMain === true;
   const taskRows = getAllTasks().map((task) => ({
     id: task.id,
@@ -206,6 +224,7 @@ async function runOrchestratedAgentInstance(
   );
 
   let firstResult: string | null = null;
+  let latestResult: string | null = null;
   let error: string | undefined;
   let closeRequested = false;
   let containerCompleted = false;
@@ -270,24 +289,31 @@ async function runOrchestratedAgentInstance(
       runId: invocation.runtime.runId,
       agentInstanceId: invocation.instanceId,
       agentRole: invocation.role,
+      interactionMode: invocation.interactionMode,
+      peerDiscussion: invocation.peerDiscussion,
     },
     (_proc, spawnedContainerName) => {
       containerName = spawnedContainerName;
     },
     async (streamedOutput: ContainerOutput) => {
-      if (!firstResult && streamedOutput.result) {
+      if (streamedOutput.result) {
         const text = stripInternalOutput(streamedOutput.result);
         if (text) {
-          firstResult = text;
-          requestClose();
-          scheduleForceStop();
-          resolveFirstResult?.({
-            instanceId: invocation.instanceId,
-            role: invocation.role,
-            status: 'success',
-            result: firstResult,
-          });
-          resolveFirstResult = null;
+          latestResult = text;
+          if (!firstResult) {
+            firstResult = text;
+          }
+          if (closeOnFirstResult) {
+            requestClose();
+            scheduleForceStop();
+            resolveFirstResult?.({
+              instanceId: invocation.instanceId,
+              role: invocation.role,
+              status: 'success',
+              result: firstResult,
+            });
+            resolveFirstResult = null;
+          }
         }
       }
 
@@ -301,10 +327,13 @@ async function runOrchestratedAgentInstance(
       containerCompleted = true;
       clearForceStopTimer();
 
-      if (!firstResult && output.result) {
+      if (output.result) {
         const text = stripInternalOutput(output.result);
         if (text) {
-          firstResult = text;
+          latestResult = text;
+          if (!firstResult) {
+            firstResult = text;
+          }
         }
       }
 
@@ -312,12 +341,13 @@ async function runOrchestratedAgentInstance(
         error = output.error || 'Unknown error';
       }
 
-      if (firstResult) {
+      const resultText = closeOnFirstResult ? firstResult : latestResult;
+      if (resultText) {
         return {
           instanceId: invocation.instanceId,
           role: invocation.role,
           status: 'success' as const,
-          result: firstResult,
+          result: resultText,
         };
       }
 
@@ -343,13 +373,17 @@ async function runOrchestratedAgentInstance(
     });
 
   try {
-    const result = await Promise.race([firstResultPromise, containerPromise]);
+    if (closeOnFirstResult) {
+      const result = await Promise.race([firstResultPromise, containerPromise]);
 
-    // Keep draining the container promise in the background so cleanup/logging
-    // can finish even if we already returned on the first result.
-    void containerPromise;
+      // Keep draining the container promise in the background so cleanup/logging
+      // can finish even if we already returned on the first result.
+      void containerPromise;
 
-    return result;
+      return result;
+    }
+
+    return await containerPromise;
   } catch (err) {
     containerCompleted = true;
     clearForceStopTimer();
@@ -423,6 +457,62 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   await channel.setTyping?.(chatJid, true);
+
+  if (isPeerDiscussionModeEnabled(group)) {
+    const peerDiscussionResult = await runPeerDiscussionMode({
+      group,
+      prompt,
+      chatJid,
+      deps: {
+        runInstance: async (invocation: PeerDiscussionAgentInvocation) => {
+          const result = await runOrchestratedAgentInstance(
+            group,
+            chatJid,
+            invocation,
+          );
+          return {
+            instanceId: result.instanceId,
+            role: invocation.role,
+            status: result.status,
+            result: result.result,
+            error: result.error,
+          } satisfies PeerDiscussionAgentResult;
+        },
+      },
+    });
+
+    await channel.setTyping?.(chatJid, false);
+
+    if (
+      peerDiscussionResult.status === 'success' &&
+      peerDiscussionResult.finalResult
+    ) {
+      await channel.sendMessage(chatJid, peerDiscussionResult.finalResult);
+      logger.info(
+        {
+          group: group.name,
+          runId: peerDiscussionResult.runId,
+          archiveDir: peerDiscussionResult.archiveDir,
+          workerCount: peerDiscussionResult.workerResults.length,
+        },
+        'Peer-discussion run completed',
+      );
+      return true;
+    }
+
+    lastAgentTimestamp[chatJid] = previousCursor;
+    saveState();
+    logger.warn(
+      {
+        group: group.name,
+        runId: peerDiscussionResult.runId,
+        archiveDir: peerDiscussionResult.archiveDir,
+        error: peerDiscussionResult.error,
+      },
+      'Peer-discussion run failed, rolled back message cursor for retry',
+    );
+    return false;
+  }
 
   if (isPlannerModeEnabled(group)) {
     const plannerResult = await runPlannerMode({

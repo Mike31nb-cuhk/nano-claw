@@ -33,6 +33,7 @@ export interface ContainerConfig {
   model?: string;
   voting?: VotingConfig;
   planner?: PlannerConfig;
+  peerDiscussion?: PeerDiscussionConfig;
 }
 
 export interface VotingConfig {
@@ -49,6 +50,16 @@ export interface PlannerConfig {
   fixedAgents?: number;
   maxRounds?: number;
   plannerModel?: string;
+  workerModel?: string;
+  aggregatorModel?: string;
+}
+
+export interface PeerDiscussionConfig {
+  enabled?: boolean;
+  workerCount?: number;
+  maxRounds?: number;
+  discussionWindowMs?: number;
+  roundTimeoutMs?: number;
   workerModel?: string;
   aggregatorModel?: string;
 }
